@@ -54,7 +54,7 @@ func (s *Secret) ParseString(v string) error {
 	const suffix = `"}`
 
 	if !strings.HasPrefix(v, prefix) || !strings.HasSuffix(v, suffix) {
-		return errors.New("kes: malformed secret")
+		return errors.New("secret is malformed")
 	}
 
 	v = strings.TrimPrefix(v, prefix)
@@ -62,10 +62,10 @@ func (s *Secret) ParseString(v string) error {
 
 	b, err := base64.StdEncoding.DecodeString(v)
 	if err != nil {
-		return errors.New("kes: malformed secret")
+		return errors.New("secret is malformed")
 	}
 	if len(b) != 32 {
-		return errors.New("kes: malformed secret")
+		return errors.New("secret is malformed")
 	}
 	copy(s[:], b)
 	return nil

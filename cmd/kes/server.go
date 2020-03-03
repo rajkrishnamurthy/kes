@@ -172,6 +172,28 @@ func server(args []string) error {
 		}
 	}
 
+	var (
+		KMSKey string
+		KMS    secret.KMS
+	)
+	switch {
+	case config.KMS.AWS.Addr != "":
+		kms := &aws.KMS{
+			Addr:   config.KMS.AWS.Addr,
+			Region: config.KMS.AWS.Region,
+			Login: aws.Credentials{
+				AccessKey:    config.KMS.AWS.Login.AccessKey,
+				SecretKey:    config.KMS.AWS.Login.SecretKey,
+				SessionToken: config.KMS.AWS.Login.SessionToken,
+			},
+		}
+		if err = kms.Authenticate(); err != nil {
+			return fmt.Errorf("Failed to connect to AWS-KMS: %v", err)
+		}
+		KMS = kms
+		KMSKey = config.KMS.AWS.Key
+	}
+
 	var store secret.Store
 	switch {
 	case config.KeyStore.Fs.Dir != "":
@@ -192,6 +214,8 @@ func server(args []string) error {
 			CacheExpireAfter:       config.Cache.Expiry.All,
 			CacheExpireUnusedAfter: config.Cache.Expiry.Unused,
 			ErrorLog:               errorLog.Log(),
+			KMS:                    KMS,
+			Key:                    KMSKey,
 		}
 	case config.KeyStore.Vault.Addr != "":
 		vaultStore := &vault.KeyStore{
@@ -210,6 +234,8 @@ func server(args []string) error {
 			ClientKeyPath:          config.KeyStore.Vault.TLS.KeyPath,
 			ClientCertPath:         config.KeyStore.Vault.TLS.CertPath,
 			CAPath:                 config.KeyStore.Vault.TLS.CAPath,
+			KMS:                    KMS,
+			Key:                    KMSKey,
 		}
 		if err := vaultStore.Authenticate(context.Background()); err != nil {
 			return fmt.Errorf("Failed to connect to Vault: %v", err)
@@ -223,6 +249,8 @@ func server(args []string) error {
 			CacheExpireAfter:       config.Cache.Expiry.All,
 			CacheExpireUnusedAfter: config.Cache.Expiry.Unused,
 			ErrorLog:               errorLog.Log(),
+			KMS:                    KMS,
+			Key:                    KMSKey,
 			Login: aws.Credentials{
 				AccessKey:    config.KeyStore.Aws.SecretsManager.Login.AccessKey,
 				SecretKey:    config.KeyStore.Aws.SecretsManager.Login.SecretKey,
@@ -238,6 +266,8 @@ func server(args []string) error {
 			CacheExpireAfter:       config.Cache.Expiry.All,
 			CacheExpireUnusedAfter: config.Cache.Expiry.Unused,
 			ErrorLog:               errorLog.Log(),
+			KMS:                    KMS,
+			Key:                    KMSKey,
 		}
 	}
 

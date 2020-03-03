@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -38,9 +39,9 @@ type Credentials struct {
 // See: https://aws.amazon.com/secrets-manager
 type SecretsManager struct {
 	// Addr is the HTTP address of the AWS Secret
-	// Manager. In general, you want to AWS directly.
-	// Therefore, use an address of the following
-	// form: secretsmanager.<region>.amazonaws.com
+	// Manager. In general, the address has the
+	// following form:
+	//  secretsmanager.<region>.amazonaws.com
 	Addr string
 	// Region is the AWS region. Even though the Addr
 	// endpoint contains that information already, this
@@ -73,6 +74,24 @@ type SecretsManager struct {
 	// standard logger.
 	ErrorLog *log.Logger
 
+	// Key is an optional key name of a cryptographic
+	// key at the KMS. If the KMS is not nil the
+	// SecretsManager will try to encrypt secrets with
+	// this key at the KMS before storing them at AWS.
+	//
+	// Therefore, Key must point to an existing key at
+	// the key management system if KMS is set.
+	Key string
+
+	// KMS is an optional KMS client used to encrypt
+	// secrets before storing them at AWS. New secrets
+	// will be encrypted with the cryptographic key
+	// referenced by Key.
+	//
+	// If not nil the SecretsManager will reject any
+	// plaintext secrets and only accept encrypted secrets.
+	KMS secret.KMS
+
 	cache  cache.Cache
 	client *secretsmanager.SecretsManager
 	once   uint32
@@ -84,7 +103,7 @@ type SecretsManager struct {
 //
 // In particular, Create creates a new entry on AWS Secrets
 // Manager with the given name containing the secret.
-func (store *SecretsManager) Create(name string, secret secret.Secret) error {
+func (store *SecretsManager) Create(name string, secret secret.Secret) (err error) {
 	if store.client == nil {
 		store.log(errNoConnection)
 		return errNoConnection
@@ -94,9 +113,18 @@ func (store *SecretsManager) Create(name string, secret secret.Secret) error {
 		return kes.ErrKeyExists
 	}
 
+	var content fmt.Stringer = secret
+	if store.KMS != nil {
+		content, err = store.KMS.Encrypt(store.Key, secret)
+		if err != nil {
+			store.logf("aws: failed to encrypt secret '%s' with master key '%s'", name, store.Key)
+			return err
+		}
+	}
+
 	createOpt := secretsmanager.CreateSecretInput{
 		Name:         aws.String(name),
-		SecretString: aws.String(secret.String()),
+		SecretString: aws.String(content.String()),
 	}
 	if store.KmsKeyID != "" {
 		createOpt.KmsKeyId = aws.String(store.KmsKeyID)
@@ -143,7 +171,7 @@ func (store *SecretsManager) Get(name string) (secret.Secret, error) {
 				return secret.Secret{}, kes.ErrKeyNotFound
 			}
 		}
-		err = fmt.Errorf("aws: failed to read secret '%s': %v", name, err)
+		err = fmt.Errorf("aws: failed to parse secret '%s': %v", name, err)
 		store.log(err)
 		return secret.Secret{}, err
 	}
@@ -155,19 +183,40 @@ func (store *SecretsManager) Get(name string) (secret.Secret, error) {
 	// However, AWS demands and specifies that only one is present -
 	// either "SecretString" or "SecretBinary" - we can check which
 	// one is present and safely assume that the other one isn't.
-	var secret secret.Secret
-	if response.SecretString != nil {
-		if err = secret.ParseString(*response.SecretString); err != nil {
-			store.logf("aws: failed to read secret '%s': %v", name, err)
-			return secret, err
+	var sec secret.Secret
+	if store.KMS == nil {
+		if response.SecretString != nil {
+			if err = sec.ParseString(*response.SecretString); err != nil {
+				store.logf("aws: failed to parse secret '%s': %v", name, err)
+				return sec, err
+			}
+		} else {
+			if _, err = sec.ReadFrom(bytes.NewReader(response.SecretBinary)); err != nil {
+				store.logf("aws: failed to parse secret '%s': %v", name, err)
+				return sec, err
+			}
 		}
 	} else {
-		if _, err = secret.ReadFrom(bytes.NewReader(response.SecretBinary)); err != nil {
-			store.logf("aws: failed to read secret '%s': %v", name, err)
-			return secret, err
+		var ciphertext secret.Ciphertext
+		if response.SecretString != nil {
+			if _, err = ciphertext.ReadFrom(strings.NewReader(*response.SecretString)); err != nil {
+				store.logf("aws: failed to parse ciphertext '%s': %v", name, err)
+				return sec, kes.ErrKeySealed
+			}
+		} else {
+			if _, err = ciphertext.ReadFrom(bytes.NewReader(response.SecretBinary)); err != nil {
+				store.logf("aws: failed to parse ciphertext '%s': %v", name, err)
+				return sec, kes.ErrKeySealed
+			}
+		}
+		sec, err = store.KMS.Decrypt(ciphertext)
+		if err != nil {
+			store.logf("aws: failed to decrypt ciphertext '%s': %v", name, err)
+			return sec, err
 		}
 	}
-	secret, _ = store.cache.Add(name, secret)
+
+	secret, _ := store.cache.Add(name, sec)
 	return secret, nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -105,6 +106,24 @@ type KeyStore struct {
 	// HTTP header on each request. For more information see:
 	// https://www.vaultproject.io/docs/enterprise/namespaces/index.html
 	Namespace string
+
+	// Key is an optional key name of a cryptographic
+	// key at the KMS. If the KMS is not nil the KeyStore
+	// will try to encrypt secrets with this key at the KMS
+	// before storing them at Vault.
+	//
+	// Therefore, Key must point to an existing key at
+	// the key management system if KMS is set.
+	Key string
+
+	// KMS is an optional KMS client used to encrypt
+	// secrets before storing them at Vault. New secrets
+	// will be encrypted with the cryptographic key
+	// referenced by Key.
+	//
+	// If not nil the KeyStore will reject any plaintext
+	// secrets and only accept encrypted secrets.
+	KMS secret.KMS
 
 	cache cache.Cache
 	once  uint32
@@ -204,28 +223,41 @@ func (store *KeyStore) Get(name string) (secret.Secret, error) {
 		if err == nil && entry == nil {
 			return secret.Secret{}, kes.ErrKeyNotFound
 		}
-		store.logf("vault: failed to read secret '%s': %v", location, err)
+		store.logf("vault: failed to parse secret '%s': %v", location, err)
 		return secret.Secret{}, err
 	}
 
 	// Verify that we got a well-formed secret key from Vault
 	v, ok := entry.Data[name]
 	if !ok || v == nil {
-		store.logf("vault: failed to read secret '%s': entry exists but no secret key is present", location)
+		store.logf("vault: failed to parse secret '%s': entry exists but no secret key is present", location)
 		return secret.Secret{}, errors.New("vault: K/V entry does not contain any value")
 	}
 	s, ok := v.(string)
 	if !ok {
-		store.logf("vault: failed to read secret '%s': invalid K/V format", location)
+		store.logf("vault: failed to parse secret '%s': invalid K/V format", location)
 		return secret.Secret{}, errors.New("vault: invalid K/V entry format")
 	}
 
-	var secret secret.Secret
-	if err = secret.ParseString(s); err != nil {
-		store.logf("vault: failed to read secret '%s': %v", location, err)
-		return secret, err
+	var sec secret.Secret
+	if store.KMS == nil {
+		if err = sec.ParseString(s); err != nil {
+			store.logf("vault: failed to parse secret '%s': %v", location, err)
+			return sec, err
+		}
+	} else {
+		var ciphertext secret.Ciphertext
+		if _, err = ciphertext.ReadFrom(strings.NewReader(s)); err != nil {
+			store.logf("vault: failed to parse ciphertext '%s': %v", location, err)
+			return sec, kes.ErrKeySealed
+		}
+		sec, err = store.KMS.Decrypt(ciphertext)
+		if err != nil {
+			store.logf("vault: failed to decrypt ciphertext '%s': %v", location, err)
+			return sec, kes.ErrKeySealed
+		}
 	}
-	secret, _ = store.cache.Add(name, secret)
+	secret, _ := store.cache.Add(name, sec)
 	return secret, nil
 }
 
@@ -235,7 +267,7 @@ func (store *KeyStore) Get(name string) (secret.Secret, error) {
 //
 // In particular, Create creates a new K/V entry on the Vault
 // key store.
-func (store *KeyStore) Create(name string, secret secret.Secret) error {
+func (store *KeyStore) Create(name string, secret secret.Secret) (err error) {
 	if store.client == nil {
 		store.log(errNoConnection)
 		return errNoConnection
@@ -247,6 +279,15 @@ func (store *KeyStore) Create(name string, secret secret.Secret) error {
 	store.initialize()
 	if _, ok := store.cache.Get(name); ok {
 		return kes.ErrKeyExists
+	}
+
+	var content fmt.Stringer = secret
+	if store.KMS != nil {
+		content, err = store.KMS.Encrypt(store.Key, secret)
+		if err != nil {
+			store.logf("fs: failed to encrypt secret '%s' with master key '%s': %v", name, store.Key, err)
+			return err
+		}
 	}
 
 	// We try to check whether key exists on the K/V store.
@@ -284,8 +325,8 @@ func (store *KeyStore) Create(name string, secret secret.Secret) error {
 	// Since there is now way we can detect that reliable we require
 	// that whoever has the permission to create keys does that in
 	// a non-racy way.
-	_, err := store.client.Logical().Write(location, map[string]interface{}{
-		name: secret.String(),
+	_, err = store.client.Logical().Write(location, map[string]interface{}{
+		name: content.String(),
 	})
 	if err != nil {
 		store.logf("vault: failed to create '%s': %v", location, err)

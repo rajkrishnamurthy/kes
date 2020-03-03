@@ -7,7 +7,9 @@ package mem
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,24 @@ type KeyStore struct {
 	// standard logger.
 	ErrorLog *log.Logger
 
+	// Key is an optional key name of a cryptographic
+	// key at the KMS. If the KMS is not nil the KeyStore
+	// will try to encrypt secrets with this key at the KMS
+	// before storing them in its in-memory store.
+	//
+	// Therefore, Key must point to an existing key at
+	// the key management system if KMS is set.
+	Key string
+
+	// KMS is an optional KMS client used to encrypt
+	// secrets before storing them in its in-memory store.
+	// New secrets will be encrypted with the cryptographic
+	// key referenced by Key.
+	//
+	// If not nil the KeyStore will reject any plaintext
+	// secrets and only accept encrypted secrets.
+	KMS secret.KMS
+
 	cache cache.Cache
 
 	lock  sync.RWMutex
@@ -48,21 +68,31 @@ type KeyStore struct {
 // Create adds the given secret key to the store if and only
 // if no entry for name exists. If an entry already exists
 // it returns kes.ErrKeyExists.
-func (store *KeyStore) Create(name string, secret secret.Secret) error {
+func (store *KeyStore) Create(name string, secret secret.Secret) (err error) {
 	store.lock.Lock()
 	defer store.lock.Unlock()
 
 	if _, ok := store.cache.Get(name); ok {
 		return kes.ErrKeyExists
 	}
-	if _, ok := store.store[name]; ok {
-		return kes.ErrKeyExists
-	}
 	if store.store == nil {
 		store.once.Do(store.initialize)
 	}
+
+	var content fmt.Stringer = secret
+	if store.KMS != nil {
+		content, err = store.KMS.Encrypt(store.Key, secret)
+		if err != nil {
+			store.logf("mem: failed to encrypt secret '%s' with master key '%s': %v", name, store.Key, err)
+			return err
+		}
+	}
+
+	if _, ok := store.store[name]; ok {
+		return kes.ErrKeyExists
+	}
 	store.cache.Set(name, secret)
-	store.store[name] = secret.String()
+	store.store[name] = content.String()
 	return nil
 }
 
@@ -94,9 +124,24 @@ func (store *KeyStore) Get(name string) (secret.Secret, error) {
 	if !ok {
 		return secret.Secret{}, kes.ErrKeyNotFound
 	}
-	if err := sec.ParseString(s); err != nil {
-		store.logf("mem: failed to read secret '%s': %v", name, err)
-		return secret.Secret{}, err
+
+	var err error
+	if store.KMS == nil {
+		if err = sec.ParseString(s); err != nil {
+			store.logf("mem: failed to parse secret '%s': %v", name, err)
+			return secret.Secret{}, err
+		}
+	} else {
+		var ciphertext secret.Ciphertext
+		if _, err = ciphertext.ReadFrom(strings.NewReader(s)); err != nil {
+			store.logf("mem: failed to parse ciphertext '%s': %v", name, err)
+			return secret.Secret{}, kes.ErrKeySealed
+		}
+		sec, err = store.KMS.Decrypt(ciphertext)
+		if err != nil {
+			store.logf("mem: failed to decrypt ciphertext '%s': %v", name, err)
+			return secret.Secret{}, kes.ErrKeySealed
+		}
 	}
 	store.cache.Set(name, sec)
 	return sec, nil

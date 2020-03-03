@@ -8,6 +8,7 @@ package fs
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -46,6 +47,24 @@ type KeyStore struct {
 	// standard logger.
 	ErrorLog *log.Logger
 
+	// Key is an optional key name of a cryptographic
+	// key at the KMS. If the KMS is not nil the KeyStore
+	// will try to encrypt secrets with this key at the KMS
+	// before storing them at the filesystem.
+	//
+	// Therefore, Key must point to an existing key at
+	// the key management system if KMS is set.
+	Key string
+
+	// KMS is an optional KMS client used to encrypt
+	// secrets before storing them at the filesystem.
+	// New secrets will be encrypted with the cryptographic
+	// key referenced by Key.
+	//
+	// If not nil the KeyStore will reject any plaintext
+	// secrets and only accept encrypted secrets.
+	KMS secret.KMS
+
 	cache cache.Cache
 	once  uint32
 }
@@ -56,10 +75,19 @@ type KeyStore struct {
 //
 // In particular, Create creates a new file in KeyStore.Dir
 // and writes the secret key to it.
-func (store *KeyStore) Create(name string, secret secret.Secret) error {
+func (store *KeyStore) Create(name string, secret secret.Secret) (err error) {
 	store.initialize()
 	if _, ok := store.cache.Get(name); ok {
 		return kes.ErrKeyExists
+	}
+
+	var content io.WriterTo = secret
+	if store.KMS != nil {
+		content, err = store.KMS.Encrypt(store.Key, secret)
+		if err != nil {
+			store.logf("fs: failed to encrypt secret '%s' with master key '%s': %v", name, store.Key, err)
+			return err
+		}
 	}
 
 	path := filepath.Join(store.Dir, name)
@@ -73,13 +101,13 @@ func (store *KeyStore) Create(name string, secret secret.Secret) error {
 	}
 	defer file.Close()
 
-	if _, err = secret.WriteTo(file); err != nil {
-		store.logf("fs: failed to write to %s: %v", path, err)
+	if _, err = content.WriteTo(file); err != nil {
 		if rmErr := os.Remove(path); rmErr != nil {
 			store.logf("fs: cannot remove %s: %v", path, err)
 		}
 		return err
 	}
+
 	if err = file.Sync(); err != nil { // Ensure that we wrote the secret key to disk
 		store.logf("fs: cannot to flush and sync %s: %v", path, err)
 		if rmErr := os.Remove(path); rmErr != nil {
@@ -115,12 +143,26 @@ func (store *KeyStore) Get(name string) (secret.Secret, error) {
 	}
 	defer file.Close()
 
-	var secret secret.Secret
-	if _, err := secret.ReadFrom(file); err != nil {
-		store.logf("fs: failed to read secret from '%s': %v", path, err)
-		return secret, err
+	var sec secret.Secret
+	if store.KMS == nil {
+		if _, err := sec.ReadFrom(file); err != nil {
+			store.logf("fs: failed to parse secret at '%s': %v", path, err)
+			return sec, err
+		}
+	} else {
+		var ciphertext secret.Ciphertext
+		if _, err := ciphertext.ReadFrom(file); err != nil {
+			store.logf("fs: failed to parse ciphertext at '%s': %v", path, err)
+			return sec, kes.ErrKeySealed
+		}
+		sec, err := store.KMS.Decrypt(ciphertext)
+		if err != nil {
+			store.logf("fs: failed to decrypt ciphertext at '%s': %v", path, err)
+			return sec, kes.ErrKeySealed
+		}
 	}
-	secret, _ = store.cache.Add(name, secret)
+
+	secret, _ := store.cache.Add(name, sec)
 	return secret, nil
 }
 
