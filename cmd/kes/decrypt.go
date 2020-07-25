@@ -5,13 +5,10 @@
 package main
 
 import (
-	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
-
-	"github.com/minio/kes"
 )
 
 const decryptCmdUsage = `usage: %s <name> <ciphertext> [<context>]
@@ -52,16 +49,11 @@ func decryptKey(args []string) error {
 		}
 	}
 
-	certificates, err := loadClientCertificates()
+	client, err := newClient(insecureSkipVerify)
 	if err != nil {
 		return err
 	}
-	client := kes.NewClient(serverAddr(), &tls.Config{
-		InsecureSkipVerify: insecureSkipVerify,
-		Certificates:       certificates,
-	})
-
-	plaintext, err := client.DecryptDataKey(name, ciphertext, context)
+	plaintext, err := client.Decrypt(name, ciphertext, context)
 	if err != nil {
 		return fmt.Errorf("Failed to decrypt data key: %v", err)
 	}

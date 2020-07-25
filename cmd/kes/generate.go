@@ -5,13 +5,10 @@
 package main
 
 import (
-	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
-
-	"github.com/minio/kes"
 )
 
 const generateCmdUsage = `usage: %s name [context]
@@ -47,27 +44,23 @@ func deriveKey(args []string) error {
 		context = b
 	}
 
-	certificates, err := loadClientCertificates()
+	client, err := newClient(insecureSkipVerify)
 	if err != nil {
 		return err
 	}
-	client := kes.NewClient(serverAddr(), &tls.Config{
-		InsecureSkipVerify: insecureSkipVerify,
-		Certificates:       certificates,
-	})
-	plaintext, ciphertext, err := client.GenerateDataKey(name, context)
+	key, err := client.GenerateKey(name, context)
 	if err != nil {
 		return fmt.Errorf("Failed to generate data key: %v", err)
 	}
 
 	if isTerm(os.Stdout) {
 		fmt.Println("{")
-		fmt.Printf("  plaintext : %s\n", base64.StdEncoding.EncodeToString(plaintext))
-		fmt.Printf("  ciphertext: %s\n", base64.StdEncoding.EncodeToString(ciphertext))
+		fmt.Printf("  plaintext : %s\n", base64.StdEncoding.EncodeToString(key.Plaintext))
+		fmt.Printf("  ciphertext: %s\n", base64.StdEncoding.EncodeToString(key.Ciphertext))
 		fmt.Println("}")
 	} else {
 		const format = `{"plaintext":"%s","ciphertext":"%s"}`
-		fmt.Printf(format, base64.StdEncoding.EncodeToString(plaintext), base64.StdEncoding.EncodeToString(ciphertext))
+		fmt.Printf(format, base64.StdEncoding.EncodeToString(key.Plaintext), base64.StdEncoding.EncodeToString(key.Ciphertext))
 	}
 	return nil
 }

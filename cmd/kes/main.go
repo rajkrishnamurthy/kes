@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/minio/kes"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
@@ -24,9 +25,9 @@ const usage = `usage: %s <command>
     server               Start a kes server.
 
     key                  Manage secret keys.
+    log                  Work with server logs.
     policy               Manage the kes server policies.
     identity             Assign policies to identities.
-    audit                Manage the kes server audit logs.                  
 
     tool                 Run specific key and identity management tools.
 
@@ -62,12 +63,12 @@ func main() {
 		err = server(args)
 	case "key":
 		err = key(args)
+	case "log":
+		err = log(args)
 	case "identity":
 		err = identity(args)
 	case "policy":
 		err = policy(args)
-	case "audit":
-		err = audit(args)
 	case "tool":
 		err = tool(args)
 	default:
@@ -102,27 +103,28 @@ func isFlagPresent(set *flag.FlagSet, name string) bool {
 	return found
 }
 
-func serverAddr() string {
-	if addr, ok := os.LookupEnv("KES_SERVER"); ok {
-		return addr
-	}
-	return "https://127.0.0.1:7373"
-}
-
-func loadClientCertificates() ([]tls.Certificate, error) {
-	certPath := os.Getenv("KES_CLIENT_TLS_CERT_FILE")
-	keyPath := os.Getenv("KES_CLIENT_TLS_KEY_FILE")
+func newClient(insecureSkipVerify bool) (*kes.Client, error) {
+	certPath := os.Getenv("KES_CLIENT_CERT")
+	keyPath := os.Getenv("KES_CLIENT_KEY")
 	if certPath == "" {
-		return nil, errors.New("No client TLS certificate: env KES_CLIENT_TLS_CERT_FILE is not set or empty")
+		return nil, errors.New("No client TLS certificate: env KES_CLIENT_CERT is not set or empty")
 	}
 	if keyPath == "" {
-		return nil, errors.New("No client TLS private key: env KES_CLIENT_TLS_KEY_FILE is not set or empty")
+		return nil, errors.New("No client TLS private key: env KES_CLIENT_KEY is not set or empty")
 	}
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to load TLS key or cert for client: %v", err)
 	}
-	return []tls.Certificate{cert}, nil
+
+	addr := "https://127.0.0.1:7373"
+	if env, ok := os.LookupEnv("KES_SERVER"); ok {
+		addr = env
+	}
+	return kes.NewClientWithConfig(addr, &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: insecureSkipVerify,
+	}), nil
 }
 
 func isTerm(f *os.File) bool { return terminal.IsTerminal(int(f.Fd())) }
